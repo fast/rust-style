@@ -48,14 +48,13 @@ imports_granularity = "Item"
 wrap_comments = true
 ```
 
-- **Top-of-file imports**: Import referenced symbols at the top of the module rather than placing `use` statements inside functions or writing repeated multi-segment `crate::...` paths inline.
-- **Meaningful qualification**: Preserve original symbol names and retain enough module or crate qualification to clarify the operation, identify its source or execution context, and disambiguate common names, even when no local name conflict exists.
-- **No arbitrary aliases**: Avoid `use ... as ...` renames because aliases obscure symbol origin and hurt workspace search. Resolve collisions through parent-module qualification first (such as `process::Command`), reserving local aliases for rare cases where qualification does not read cleanly. Import traits used solely for their methods with `use ...::Trait as _;`.
-- **Inline path exceptions**: Use inline fully qualified paths when importing the parent module would collide with a primary local concept (such as `impl core::error::Error for Error`) or for rare runtime hooks such as `std::panic::catch_unwind`.
-- **Crate-anchored paths**: Start ordinary intra-crate imports at `crate::...`. Avoid `super::...` and private `use self::...` imports so moving files across directories does not invalidate relative paths. Reserve `use super::*;` exclusively for `#[cfg(test)]` and colocated benchmark modules.
+- **Module-header imports by default**: Place shared `use` imports at the top of the enclosing module rather than repeating identical imports across functions. Keep a `use` local to a function, block, or `match` arm when scoping avoids trait method ambiguity (such as bringing an internal trait into scope for one generic helper without colliding with another trait imported across the file), isolates heavy helper-only namespaces (such as CLI styling, table formatting, snippet rendering, or large enum variant globs) to the single function that uses them, or keeps imports inside a `#[cfg(...)]` or `#[test]` item instead of scattering extra `#[cfg(...)]` attributes across top-of-file imports or wrapping a single `#[test]` in an artificial module.
+- **No inline `crate::` or `super::` paths**: Never spell `crate::...`, `super::...`, or `self::...` inline in expressions or type signatures. Always bring intra-crate items into scope via `use crate::...` (at the module header or in a scoped local `use`), avoid `use super::...` and private `use self::...` imports so moving files across directories does not break relative paths, and reserve `use super::*;` exclusively for `#[cfg(test)]` and colocated benchmark modules.
+- **External and standard-library inline paths when simpler**: Spelling out `std::...`, `core::...`, or `<external_crate>::...` inline is welcome whenever it reads more simply than adding an import, such as one-off calls (`std::env::var`, `std::panic::catch_unwind`), avoiding `#[cfg(...)]`-gated imports (`std::time::Duration` inside a `#[cfg(test)]` helper), or disambiguating colliding names (`impl core::error::Error for Error`, `jiff::Timestamp` vs. `proto::Timestamp`, or wrapper fields `Mutex(std::sync::Mutex<T>)`).
+- **Meaningful qualification and minimal aliases**: Preserve original symbol names with enough module or crate qualification to clarify context and disambiguate common names (`io::Error`, `fs::read`, `process::Command`, `atomic::Ordering`), even without a local conflict. Avoid arbitrary `use ... as ...` renames because aliases obscure symbol origin and hurt workspace search; resolve collisions through parent-module qualification or external inline paths first, and import method-only traits with `use ...::Trait as _;` (at module scope unless local scoping avoids ambiguity or `#[cfg]` noise).
 
 ```rust
-// Good: module qualification clarifies context and disambiguates common names.
+// Good: module-header qualified imports, scoped local `use`, and simple inline `std::` paths.
 use std::fs;
 use std::io;
 use std::io::Write as _;
@@ -71,16 +70,33 @@ fn read_magic(path: &str, codec: &Codec, raw: *const u32) -> Result<u32, io::Err
     // SAFETY: caller guarantees `raw` is valid for a 4-byte unaligned read.
     Ok(unsafe { ptr::read_unaligned(raw) })
 }
+
+#[test]
+fn roundtrip_smoke() {
+    use crate::codec::Header;
+
+    let timeout = std::time::Duration::from_secs(1);
+    let _ = (Header::default(), timeout);
+}
 ```
 
 ```rust
-// Bad: bare generic names lose context, relative `super::` is fragile, and aliases hurt search.
+// Bad: bare generic names lose context, `super::` is fragile, aliases hurt search,
+// `#[cfg]` gates clutter file headers, and `crate::` paths appear inline.
 use std::fs::read;
 use std::io::Error as IoError;
 use std::ptr::read_unaligned;
 use std::str::from_utf8;
+#[cfg(test)]
+use std::time::Duration;
 
-use super::codec::Codec;
+use super::codec::Header;
+#[cfg(test)]
+use super::codec::Fixture;
+
+fn decode_bytes(bytes: &[u8]) -> Result<Vec<u8>, IoError> {
+    crate::codec::Codec::decode(bytes)
+}
 ```
 
 ## Visibility
@@ -126,7 +142,7 @@ impl Session {
 
 - **Naming and layout**: Name types, fields, and functions by their concrete role, using the shortest name that stays clear. Keep a type and its primary `impl` block together, placing public API methods before private helpers. Reserve `len` and `is_empty` for collection or slice-like views; choose specific names when reporting byte size, capacity, weight, or retained samples.
 - **Constructors and builders**: Use `new` for the primary constructor (implementing `Default` when a meaningful parameterless value exists, and marking trivial constructors `const fn` when practical) and `with_*` for alternative required inputs. Introduce a dedicated `*Builder` type when construction has multiple optional settings or staged validation rather than proliferating combinatoric constructors.
-- **No leading underscores on struct fields**: Do not prefix struct fields with `_` merely to silence unused-field warnings. Name retained fields after the resource, guard, or marker they hold, and annotate unread ownership fields with `#[expect(dead_code, reason = "...")]` (`PhantomData` fields do not trigger `dead_code` and need neither `_` nor an attribute).
+- **No leading underscores on fields**: Do not prefix struct, union, or enum-variant fields with `_` merely to silence unused-field warnings, as leading underscores obscure construction sites and bypass stale-lint checks. Name retained fields after the resource, guard, or marker they hold, and annotate unread ownership fields with `#[expect(dead_code, reason = "...")]` (`PhantomData` fields do not trigger `dead_code` and need neither `_` nor an attribute). By contrast, `_param` for unused function parameters and `let _guard = ...;` for local RAII drop guards remain idiomatic Rust.
 
 ```rust
 use std::marker::PhantomData;
@@ -149,8 +165,8 @@ pub struct PooledConn<'a> {
 ```
 
 - **Standard traits**: Derive applicable value traits (`Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`, `Hash`) on plain data types and configuration enums. Deliberately omit `PartialEq` and `Eq` when field-wise equality would reflect internal layout, history, or random seeds rather than a sound domain equality contract. Implement `Debug` manually on custom iterators and view types when `#[derive(Debug)]` would impose unnecessary generic bounds on type parameters.
-- **Restrained `#[must_use]`**: Omit routine `#[must_use]` annotations on ordinary getters, queries, and consuming builder methods. Reserve `#[must_use = "..."]` with an explicit reason for lazy iterators or futures and for `&self` methods that callers could mistake for in-place mutators.
-- **Lint baseline and `#[expect]`**: Prefer `#[expect(lint, reason = "...")]` over `#[allow(lint)]` so local suppressions fail once the underlying warning disappears. In `Cargo.toml`, configure workspace lints to catch unknown lints, ignored `must_use` values, stray debug macros, and unintended `unsafe` usage:
+- **Restrained `#[must_use]`**: Omit routine `#[must_use]` annotations on ordinary getters, queries, and consuming builder methods. Reserve `#[must_use = "..."]` with an explicit reason for lazy iterators or futures, RAII guards, non-`Result` outcome or report types whose dismissal silently loses failures or resources, and `&self` methods that callers could mistake for in-place mutators.
+- **Lint baseline and `#[expect]`**: Prefer `#[expect(lint, reason = "...")]` over `#[allow(lint)]` so local suppressions fail once the underlying warning disappears; targeted `#[allow(lint)]` with an explanatory comment is acceptable only when reachability genuinely varies across feature or toolchain matrices. In `Cargo.toml`, configure workspace lints to catch unknown lints, ignored `must_use` values, stray debug macros, and unintended `unsafe` usage:
 
 ```toml
 [workspace.lints.rust]
